@@ -8,14 +8,23 @@ from dataclasses import asdict, dataclass
 from requests.auth import HTTPBasicAuth
 from typing import Any, Dict, List, Literal, Optional, Type, TypeVar
 
-
+# Pelican API information
 PELICAN_API_KEY = os.getenv('PELICAN_API_KEY')
 PELICAN_API_BASE_URL = os.getenv('PELICAN_API_BASE_URL', '')
+
+# Mikrotik API information
 MIKROTIK_API_BASE_URL = os.getenv('MIKROTIK_API_BASE_URL', '')
 MIKROTIK_API_USERNAME = os.getenv('MIKROTIK_API_USERNAME')
 MIKROTIK_API_PASSWORD = os.getenv('MIKROTIK_API_PASSWORD')
+
+# A string used to identify a rule as having been set by this script
+# Only rules containing this string in the comments will ever be deleted
 MIKROTIK_API_RULE_IDENTIFIER = os.getenv('MIKROTIK_API_RULE_IDENTIFIER', 'Pelican-to-Mikrotik')
+
+# Allows setting additional parameters not tracked by Pelican
+# MIKROTIK_API_RULE_TEMPLATE='{"dst-address-list": "!gateways", "dst-address-type": "local"}'
 MIKROTIK_API_RULE_TEMPLATE = os.getenv('MIKROTIK_API_RULE_TEMPLATE', '{}')
+
 
 def trace(message: str):
     logging.log(5, message)
@@ -120,10 +129,12 @@ class Allocation:
         return sorted([a for a in cls.get_allocations_list(node_id) if a.assigned],
             key=lambda allocation: allocation._node_id)
 
-    def build_comment(self) -> str:
-        return (f"{self.node.name}"
+    def build_comment(self, protocol: str) -> str:
+        return (f"{MIKROTIK_API_RULE_IDENTIFIER}"
+                f"-{self.node.name}"
                 f"{f'-{self.server.name}' if self.server is not None else ''}"
-                f"-{self.alias if self.alias is not None else f'{self.ip}:{self.port}'}")
+                f"-{self.alias if self.alias is not None else f'{self.ip}:{self.port}'}"
+                f"-{protocol}")
 
     def as_mikrotik_rule(self, protocol: Literal['tcp', 'udp']) -> "NATRule":
         new_rule = NATRule.build_template()
@@ -131,7 +142,8 @@ class Allocation:
         new_rule.to_addresses = self.ip
         new_rule.to_ports = str(self.port)
         new_rule.dst_port = str(self.port)
-        new_rule.comment = self.build_comment()
+        new_rule.comment = self.build_comment(protocol)
+        #logging.info(f"mikrotik rule: { {k: v for k, v in dict(asdict(new_rule)).items() if v is not None}}")
         return new_rule
 
 R = TypeVar("R", bound="NATRule")
@@ -142,7 +154,7 @@ class NATRule:
     action: str
     address_list: Optional[str] = None
     address_list_timeout: Optional[str] = None
-    bytes: Optional[str] = None
+    #bytes: Optional[str] = None
     comment: Optional[str] = None
     connection_bytes: Optional[str] = None
     connection_limit: Optional[str] = None
@@ -167,7 +179,7 @@ class NATRule:
     in_interface: Optional[str] = None
     in_interface_list: Optional[str] = None
     ingress_priority: Optional[str] = None
-    invalid: Optional[bool] = None
+    invalid: Optional[str] = None
     ipsec_policy: Optional[str] = None
     ipv4_options: Optional[str] = None
     jump_target: Optional[str] = None
@@ -222,47 +234,73 @@ class NATRule:
     def from_dict(cls: Type[R], data: Dict[str, Any]) -> R:
         logging.debug(f"{data=}")
         new_dict = {}
+        problem_keys = ['bytes']
         for k, v in data.items():
-            new_dict[k.replace('-', '_').removeprefix('.')] = v
+            if k not in problem_keys:
+                new_dict[k.replace('-', '_').removeprefix('.')] = v
         logging.debug(f"{new_dict=}")
         return cls(**new_dict)
 
     @classmethod
     def build_template(cls: Type[R]) -> R:
-        template_rule = cls(id="TEMPLATE", action="dst-nat", chain="dstnat")
+        def custom_decoder(obj):
+            return {key.replace('-', '_'): value for key, value in obj.items()}
+        
+        template_rule = cls.from_dict(dict(id="TEMPLATE", action="dst-nat", chain="dstnat"))
         try:
-            template_args = json.loads(MIKROTIK_API_RULE_TEMPLATE)
+            template_args = json.loads(MIKROTIK_API_RULE_TEMPLATE, object_hook=custom_decoder)
+            #template_keys = list(template_args.keys())
+            #logging.info(f"{template_args=} {template_keys=}")
             if not isinstance(template_args, dict):
                 logging.warning(f"Mikrotik rule template should be a JSON dictionary, got {type(template_args).__name__}")
             else:
                 for k, v in template_args.items():
-                    if k not in ["to_addresses", "to_ports", "dst_port"]:
-                        setattr(template_rule, k, v)
-                    else:
-                        logging.debug(f"not setting {k} in template rule")
+                    #logging.info(f"{k=} {v=}")
+                    setattr(template_rule, k, v)
         except json.JSONDecodeError:
-            logging.error(f"Could not decode MIKROTIK_API_RULE_TEMPLATE")
-        
+            raise ValueError(f"Could not decode MIKROTIK_API_RULE_TEMPLATE")
+
+        template_rule.disabled = 'false'
+        template_rule.invalid = 'false'
+
         return template_rule
 
-    def match(self, other_rule: "NATRule", exclude: List[str]) -> bool:
-        problem_attributes = ['bytes', 'log', 'log_prefix', 'dynamic', 'packets'] + exclude
+    def _key_filter(self, other_rule: "NATRule", include: List[str] = [], exclude: List[str] = []) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        problem_attributes = ['log', 'log_prefix', 'dynamic', 'packets']
         me = asdict(self)
         other = asdict(other_rule)
-        for p in problem_attributes:
-            me.pop(p)
-            other.pop(p)
-        logging.info(f"{set(me) ^ set(other)}")
-        return set(me) == set(other)
 
-    def match_without_enablement(self, other_rule: "NATRule"):
-        return self.match(other_rule, exclude=['disabled'])
+        for k in set(list(me.keys()) + list(other.keys())):
+            if len(include) == 0:
+                # all cases without include list
+                # exclude is added to problem_attributes
+                if k in problem_attributes + exclude:
+                    me.pop(k)
+                    other.pop(k)
+            else:
+                # include list cases
+                if len(exclude) == 0:
+                    # include list, no exclude list
+                    if k not in include:
+                        me.pop(k)
+                        other.pop(k)
+                else:
+                    # include and exclude list
+                    # include takes priority
+                    if k not in include or k in problem_attributes + exclude:
+                        me.pop(k)
+                        other.pop(k)
+        return me, other
+        
+    def match(self, other_rule: "NATRule", include: List[str] = [], exclude: List[str] = []) -> bool:
+        me, other = self._key_filter(other_rule, include=include, exclude=exclude)
+        result = bool(set(me.items()) == set(other.items()))
+        return result
 
-    def match_without_comment(self, other_rule: "NATRule") -> bool:
-        return self.match(other_rule, exclude=['comment'])
-
-    def match_without_id(self, other_rule: "NATRule") -> bool:
-        return self.match(other_rule, exclude=['id'])
+    def difference(self, other_rule: "NATRule", include: List[str] = [], exclude: List[str] = []) -> List[tuple[str, Any]]:
+        me, other = self._key_filter(other_rule, include=include, exclude=exclude)
+        result = sorted(set(me.items()) ^ set(other.items()), key=lambda k: k[0])
+        return result
 
 class HTTPClient:
     def __init__(self,
@@ -331,13 +369,9 @@ class HTTPClient:
         return request('GET', f"{path}")
 
 http_client = HTTPClient(
-        PELICAN_API_BASE_URL,
-        api_key=PELICAN_API_KEY
-    )
-
-# class PelicanClient:
-#     def __init__(self, http_client: HTTPClient):
-#         self.http_client = http_client
+    PELICAN_API_BASE_URL,
+    api_key=PELICAN_API_KEY
+)
 
 class MikrotikClient:
     http_client: HTTPClient
@@ -360,7 +394,6 @@ class MikrotikClient:
         raise NotImplementedError
 
     def get_nat_rule_by_ip_and_port(self, ip: str, port: int) -> List[NATRule]:
-        #raise NotImplementedError
         # Parameter overlap with Pelican allocation:
         # ip address:
         #  to_addresses
@@ -374,7 +407,7 @@ class MikrotikClient:
                 and nat_rule.dst_port == str(port)
                 and nat_rule.to_ports == str(port)
             ):
-                logging.debug(f"adding rule {nat_rule}")
+                logging.info(f"{ip=} {port=} adding rule {nat_rule}")
                 return_list.append(nat_rule)
         return return_list
 
@@ -388,55 +421,59 @@ mikrotik_client = MikrotikClient(
 def __main__():
     rule_list = mikrotik_client.get_nat_rules()
     allocation_dict: Dict[int, List[Allocation]] = {}
+    allocation_rules: List[NATRule] = []
     for n in Node.get_nodes_id_list():
         allocation_dict[n] = Allocation.get_active_allocations_list(n)
     for node_id, allocations in allocation_dict.items():
         node = Node.get_node(node_id)
         print(f"Allocations for node {node.name} ({node.id}):")
-        for a in allocations:
-            allocation_rules = []
+        for a in sorted(allocations, key=lambda a: a.id):
             allocation_rules.append(a.as_mikrotik_rule(protocol='tcp'))
             allocation_rules.append(a.as_mikrotik_rule(protocol='udp'))
 
-            logging.info(f"{a.alias=} {a.assigned=} {a.id=} {a.ip=} {a.notes=} {a.port=} {a._node_id=} {a._server_id=}")
+            print(f"{a.id}\t| {a.node.name if a.node is not None else a.ip}:{a.port} { '(' + a.alias + ') ' if a.alias is not None else ''}\t{a.server.name if a.server is not None else 'Unassigned'}\t{f'Notes: {a.notes}' if a.notes is not None else ''}")
 
-            for allocation_rule in allocation_rules:
-                found = False
-                for r in rule_list:
-                    # if allocation exists as rule exactly, do nothing
-                    #   - magic string in comment
-                    #   - allocation alias in comment, if any
-                    #   - server name in comment, if any
-                    #   - ip and port match
-                    #   - template values match
-                    if allocation_rule.match_without_id(r):
-                        logging.info(f"{allocation_rule.protocol.upper()} rule for allocation {a.id} already present, doing nothing")
-                        found = True
-                        break
+    for allocation_rule in allocation_rules:
+        found = False
+        for r in rule_list:
+            # if allocation exists as rule exactly, do nothing
+            #   - magic string in comment
+            #   - allocation alias in comment, if any
+            #   - server name in comment, if any
+            #   - ip and port match
+            #   - template values match
+            if allocation_rule.match(r, exclude=['id', ]) is True:
+                print(f"{str(allocation_rule.protocol).upper()} rule for allocation {allocation_rule.comment} already present, doing nothing")
+                found = True
+                break
 
-                    # if allocation exists as rule, but doesn't have correct comment, update comment
-                    #   - ip and port match
-                    #   - template values match
-                    #   - comment is not correct format
-                
-                    #logging.warning(f"\n{allocation_rule=}\n{r=}\n")
-                    if allocation_rule.match_without_comment(r):
-                        logging.info(f"{allocation_rule.protocol.upper()} rule for allocation {a.id} already present but needs comment update")
-                        found = True
-                        break
+            # if allocation exists as rule, but doesn't have correct comment, update comment
+            #   - ip and port match
+            #   - template values match
+            #   - comment is not correct format
+            elif allocation_rule.match(r, exclude=['id', 'comment']):
+                print(f"{str(allocation_rule.protocol).upper()} rule exists for allocation{allocation_rule.comment},\n"
+                      f"  but ID string {MIKROTIK_API_RULE_IDENTIFIER} not present in rule comment {r.comment}\n"
+                      f"  If you want this rule to be managed by this script, change the comment to {allocation_rule.comment}")
+                found = True
+                break
 
-                    # if rule exists, but one of ip, port, or template values doesn't match, do nothing and warn
-                    partial_matches = mikrotik_client.get_nat_rule_by_ip_and_port(a.ip, a.port)
-                    if len(partial_matches) != 0:
-                        logging.warning(f"{allocation_rule.protocol.upper()} partial match rule for allocation {a.id} found, doing nothing to prevent breakage")
-                        found = True
-                        break
+            # if rule exists (ip, port match) and template values doesn't match, do nothing and warn
+            if allocation_rule.to_addresses is not None and allocation_rule.to_ports is not None:
+                if allocation_rule.match(r, include=['to_addresses', 'to_ports', 'dst_port', 'protocol', 'chain', 'action', 'disabled']):
+                    print(f"{str(allocation_rule.protocol).upper()} partial match rule for allocation {allocation_rule.comment} found, doing nothing to prevent breakage")
+                    found = True
+                    break
 
-                if found == True:
-                    continue
-
-                # if rule does not exist, add it
-                logging.info(f"Adding {allocation_rule.protocol.upper()} rule for allocation {a}")
+            if found == True:
+                print(f"Found full or partial match for {allocation_rule.comment}, not adding")
+                break
+        else:
+            # if rule does not exist, add it
+            # TODO: actually add rules lol
+            print(f"Adding {str(allocation_rule.protocol).upper()} rule for allocation {allocation_rule.comment}")
+        
+        # TODO: delete rules with matching comments but no matching allocation
 
 
 if __name__ == "__main__":
