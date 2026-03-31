@@ -3,9 +3,11 @@ import json
 import logging
 import os
 import requests
+import time
 
 from dataclasses import asdict, dataclass
 from requests.auth import HTTPBasicAuth
+from requests.exceptions import HTTPError
 from typing import Any, Dict, List, Literal, Optional, Type, TypeVar
 
 # Pelican API information
@@ -38,13 +40,13 @@ class Server:
     @classmethod
     def get_server(cls: Type[S], server_id: int) -> S:
         server_data = http_client.get(f"/api/application/servers/{server_id}")
-        logging.debug(f"{server_data=}")
+        trace(f"{server_data=}")
         return cls(id=server_data['attributes']['id'], name=server_data['attributes']['name'])
 
     @classmethod
     def get_servers_list(cls: Type[S]) -> List[S]:
         server_data = http_client.get("/api/application/servers/")
-        logging.debug(f"{server_data=}")
+        trace(f"{server_data=}")
         return [cls(id=int(s['attributes']['id']), name=s['attributes']['name']) for s in server_data]
 
 N = TypeVar("N", bound="Node")
@@ -57,13 +59,13 @@ class Node:
     @classmethod
     def get_node(cls: Type[N], node_id: int) -> N:
         node_data = http_client.get(f"/api/application/nodes/{node_id}")['attributes']
-        logging.debug(f"{node_data=}")
+        trace(f"{node_data=}")
         return cls(name=node_data['name'], id=int(node_data['id']), fqdn=node_data['fqdn'])
 
     @classmethod
     def get_nodes_list(cls) -> List["Node"]:
         node_data = http_client.get("/api/application/nodes/")
-        logging.debug(f"{node_data=}")
+        trace(f"{node_data=}")
         return [cls(name=n['attributes']['name'],
                     id=int(n['attributes']['id']),
                     fqdn=n['attributes']['fqdn']) 
@@ -72,7 +74,7 @@ class Node:
     @classmethod
     def get_nodes_id_list(cls) -> List[int]:
         node_list_data = cls.get_nodes_list()
-        logging.debug(f'{node_list_data=}')
+        trace(f'{node_list_data=}')
         return [int(n.id) for n in node_list_data]
 
 A = TypeVar("A", bound="Allocation")
@@ -105,17 +107,17 @@ class Allocation:
             server_id = None
             try:
                 relationship_data = a['attributes'].pop('relationships')
-                logging.debug(f"{relationship_data=}")
+                trace(f"{relationship_data=}")
                 try:
                     server_data = relationship_data.pop('server')['attributes']
-                    logging.debug(f"{server_data=}")
+                    trace(f"{server_data=}")
                     if server_data is not None:
                         server_id = int(server_data['id'])
                 except KeyError:
                     logging.debug(f"no server relationship data in allocation {a['attributes']['id']}")
             except KeyError:
                 logging.debug(f"no relationship data in allocation {a['attributes']['id']}")
-            logging.debug(f"{a['attributes']=}")
+            trace(f"{a['attributes']=}")
             return_list.append(cls(
                 **a['attributes'],
                 _node_id=node_id,
@@ -143,7 +145,7 @@ class Allocation:
         new_rule.to_ports = str(self.port)
         new_rule.dst_port = str(self.port)
         new_rule.comment = self.build_comment(protocol)
-        #logging.info(f"mikrotik rule: { {k: v for k, v in dict(asdict(new_rule)).items() if v is not None}}")
+        logging.debug(f"mikrotik rule: { {k: v for k, v in dict(asdict(new_rule)).items() if v is not None} }")
         return new_rule
 
 R = TypeVar("R", bound="NATRule")
@@ -232,13 +234,13 @@ class NATRule:
 
     @classmethod
     def from_dict(cls: Type[R], data: Dict[str, Any]) -> R:
-        logging.debug(f"{data=}")
+        trace(f"{data=}")
         new_dict = {}
         problem_keys = ['bytes']
         for k, v in data.items():
             if k not in problem_keys:
                 new_dict[k.replace('-', '_').removeprefix('.')] = v
-        logging.debug(f"{new_dict=}")
+        trace(f"{new_dict=}")
         return cls(**new_dict)
 
     @classmethod
@@ -250,12 +252,12 @@ class NATRule:
         try:
             template_args = json.loads(MIKROTIK_API_RULE_TEMPLATE, object_hook=custom_decoder)
             #template_keys = list(template_args.keys())
-            #logging.info(f"{template_args=} {template_keys=}")
+            #trace(f"{template_args=} {template_keys=}")
             if not isinstance(template_args, dict):
                 logging.warning(f"Mikrotik rule template should be a JSON dictionary, got {type(template_args).__name__}")
             else:
                 for k, v in template_args.items():
-                    #logging.info(f"{k=} {v=}")
+                    #trace(f"{k=} {v=}")
                     setattr(template_rule, k, v)
         except json.JSONDecodeError:
             raise ValueError(f"Could not decode MIKROTIK_API_RULE_TEMPLATE")
@@ -264,6 +266,20 @@ class NATRule:
         template_rule.invalid = 'false'
 
         return template_rule
+
+    def to_dict(self):
+        return {k: v for k, v in dict(asdict(self)).items() if v is not None}
+
+    def to_payload(self) -> str:
+        data = self.build_template().to_dict()
+        logging.debug(f"{data=}")
+        data.update(self.to_dict())
+        for bad_key in ['id', 'invalid']:
+            data.pop(bad_key)
+        for k, v in data.items():
+            data[k] = v.replace("'", '_')
+        return json.dumps(
+            {k.replace('_', '-'): v for k, v in data.items()})
 
     def _key_filter(self, other_rule: "NATRule", include: List[str] = [], exclude: List[str] = []) -> tuple[Dict[str, Any], Dict[str, Any]]:
         problem_attributes = ['log', 'log_prefix', 'dynamic', 'packets']
@@ -317,7 +333,7 @@ class HTTPClient:
             self.basic_auth = None
             self.api_key = api_key
 
-    def _request(self, method: str, path: str) -> Any:
+    def _request(self, method: str, path: str, /, **kwargs) -> Any:
         headers = {
             'Content-type': 'application/json'
         }
@@ -327,14 +343,22 @@ class HTTPClient:
             method,
             f"{self.base_url}{path}",
             headers=headers,
-            auth=self.basic_auth
+            auth=self.basic_auth,
+            **kwargs
         )
         trace(f"{request_data=} {request_data.text=}")
-        request_data.raise_for_status()
+        if request_data.status_code >= 300:
+            if request_data.status_code == 429:
+                logging.info(f"Hit rate limit for {path}, backing off")
+                time.sleep(3)
+                return self._request(method, path, **kwargs)
+            else:
+                logging.error(f"Error {request_data.status_code}: {request_data.text}")
+                raise HTTPError(request_data.text, request=request_data.request, response=request_data)
         return request_data.json()
 
-    def _request_with_pages(self, method: str, path: str) -> Any:
-        request_data = self._request(method, path)
+    def _request_with_pages(self, method: str, path: str, /, **kwargs) -> Any:
+        request_data = self._request(method, path, **kwargs)
         trace(f"{request_data=}")
         if 'data' in request_data.keys():
             return_data = request_data['data']
@@ -361,12 +385,18 @@ class HTTPClient:
             trace('no metadata in request')
         return return_data
 
-    def get(self, path: str, paginated: bool = True) -> Any:
+    def get(self, path: str, /, paginated: bool = True, **kwargs) -> Any:
         if paginated:
             request = self._request_with_pages
         else:
             request = self._request
-        return request('GET', f"{path}")
+        return request('GET', path, **kwargs)
+
+    def post(self, path: str, /, **kwargs) -> Any:
+        return self._request('POST', path, **kwargs)
+
+    def put(self, path: str, /, **kwargs) -> Any:
+        return self._request('PUT', path, **kwargs)
 
 http_client = HTTPClient(
     PELICAN_API_BASE_URL,
@@ -387,10 +417,15 @@ class MikrotikClient:
             return_list.append(NATRule.from_dict(n))
         return return_list
     
-    def add_nat_rule(self):
-        raise NotImplementedError
+    def add_nat_rule(self, rule: NATRule) -> None:
+        logging.debug(f"{rule.to_payload()=}")
+        result = self.http_client.put(
+           '/rest/ip/firewall/nat',
+           data=rule.to_payload()
+        )
+        trace(f"{result=}")
 
-    def remove_nat_rule(self):
+    def remove_nat_rule(self, rule: NATRule):
         raise NotImplementedError
 
     def get_nat_rule_by_ip_and_port(self, ip: str, port: int) -> List[NATRule]:
@@ -407,7 +442,7 @@ class MikrotikClient:
                 and nat_rule.dst_port == str(port)
                 and nat_rule.to_ports == str(port)
             ):
-                logging.info(f"{ip=} {port=} adding rule {nat_rule}")
+                logging.debug(f"{ip=} {port=} adding rule {nat_rule}")
                 return_list.append(nat_rule)
         return return_list
 
@@ -470,8 +505,8 @@ def __main__():
                 break
         else:
             # if rule does not exist, add it
-            # TODO: actually add rules lol
             print(f"Adding {str(allocation_rule.protocol).upper()} rule for allocation {allocation_rule.comment}")
+            mikrotik_client.add_nat_rule(allocation_rule)
         
         # TODO: delete rules with matching comments but no matching allocation
 
